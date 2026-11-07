@@ -1,3 +1,4 @@
 online-judge:
   engine: mariadb
   database: online_judge
+  sqllab: [mariadb-primary, mariadb-secondary]
