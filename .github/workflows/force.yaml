@@ -1,0 +1,38 @@
+name: force
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [development, production]
+      service:
+        type: string
+        required: true
+      version:
+        type: number
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: atlas-${{ inputs.environment }}
+
+jobs:
+  force:
+    runs-on: atlas-${{ inputs.environment }}
+    env:
+      DIR: ${{ inputs.environment }}/${{ inputs.service }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          service: ${{ inputs.service }}
+
+      - name: Force the version
+        run: |
+          set -euo pipefail
+          migrate -path "${DIR}" -database "${MIGRATE_URL}" force "${VERSION}"
+          migrate -path "${DIR}" -database "${MIGRATE_URL}" version

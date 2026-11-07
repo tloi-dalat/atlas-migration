@@ -1,0 +1,30 @@
+name: setup
+description: Install atlas, migrate, yq and gh, then export the connection URLs of a service
+inputs:
+  service:
+    description: Service name in services.yaml
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install tools
+      shell: bash
+      run: |
+        set -euo pipefail
+        bin="${RUNNER_TEMP}/bin"
+        tmp="$(mktemp -d)"
+        mkdir -p "${bin}"
+        curl -sSfL -o "${bin}/atlas" https://release.ariga.io/atlas/atlas-community-linux-amd64-v1.3.3
+        curl -sSfL -o "${bin}/yq" https://github.com/mikefarah/yq/releases/download/v4.54.1/yq_linux_amd64
+        curl -sSfL https://github.com/golang-migrate/migrate/releases/download/v4.20.1/migrate.linux-amd64.tar.gz | tar -xz -C "${tmp}"
+        find "${tmp}" -type f -name 'migrate*' ! -name '*.md' -exec mv {} "${bin}/migrate" \; -quit
+        curl -sSfL https://github.com/cli/cli/releases/download/v2.103.3/gh_2.103.3_linux_amd64.tar.gz | tar -xz -C "${tmp}"
+        mv "${tmp}/gh_2.103.3_linux_amd64/bin/gh" "${bin}/gh"
+        chmod +x "${bin}"/*
+        echo "${bin}" >> "${GITHUB_PATH}"
+
+    - name: Export connection URLs
+      shell: bash
+      env:
+        SERVICE: ${{ inputs.service }}
+      run: ./scripts/connect.sh
