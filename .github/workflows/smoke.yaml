@@ -1,0 +1,33 @@
+name: smoke
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [development, production]
+
+permissions: {}
+
+jobs:
+  smoke:
+    runs-on: atlas-${{ inputs.environment }}
+    steps:
+      - name: Mask secrets
+        run: echo "::add-mask::${MARIADB_PASSWORD}"
+
+      - name: Install atlas
+        run: |
+          curl -sSfL -o "${RUNNER_TEMP}/atlas" https://release.ariga.io/atlas/atlas-community-linux-amd64-v1.3.3
+          chmod +x "${RUNNER_TEMP}/atlas"
+          "${RUNNER_TEMP}/atlas" version
+
+      - name: Inspect online_judge
+        run: |
+          "${RUNNER_TEMP}/atlas" schema inspect \
+            -u "mysql://atlas:${MARIADB_PASSWORD}@${MARIADB_HOST}:${MARIADB_PORT}/online_judge" \
+            | grep -c '^table '
+
+      - name: Inspect scratch database
+        run: |
+          "${RUNNER_TEMP}/atlas" schema inspect \
+            -u "mysql://atlas:${MARIADB_PASSWORD}@${MARIADB_HOST}:${MARIADB_PORT}/atlas"
