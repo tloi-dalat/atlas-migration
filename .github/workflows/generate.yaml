@@ -1,0 +1,218 @@
+name: generate
+run-name: generate ${{ inputs.service }} ${{ inputs.name }} (${{ inputs.environment }})
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [development, production]
+      service:
+        description: Service repository in tloi-dalat, a key of services.yaml
+        type: string
+        required: true
+      sha:
+        description: Commit of the service whose schema/ is the desired state
+        type: string
+        required: true
+      name:
+        description: pr<number> for development, the release tag for production
+        type: string
+        required: true
+      pr:
+        description: Pull request number in the service, empty for a release
+        type: string
+        default: ''
+      check-id:
+        description: Check run to update in the service
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  generate:
+    runs-on: atlas-${{ inputs.environment }}
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      SERVICE: ${{ inputs.service }}
+      SOURCE_REPO: tloi-dalat/${{ inputs.service }}
+      SHA: ${{ inputs.sha }}
+      NAME: ${{ inputs.name }}
+      PR: ${{ inputs.pr }}
+      CHECK_ID: ${{ inputs.check-id }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Check inputs
+        run: |
+          set -euo pipefail
+          [[ "${SERVICE}" =~ ^[a-z0-9-]+$ ]] || { echo "::error::bad service: ${SERVICE}"; exit 1; }
+          [[ "${SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad sha: ${SHA}"; exit 1; }
+          [[ "${NAME}" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::bad name: ${NAME}"; exit 1; }
+          [[ "${PR}" =~ ^[0-9]*$ ]] || { echo "::error::bad pr: ${PR}"; exit 1; }
+          [[ "${CHECK_ID}" =~ ^[0-9]+$ ]] || { echo "::error::bad check-id: ${CHECK_ID}"; exit 1; }
+
+      - id: repo-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.ATLAS_APP_ID }}
+          private-key: ${{ secrets.ATLAS_APP_PRIVATE_KEY }}
+          repositories: atlas-migration
+          permission-contents: write
+          permission-pull-requests: write
+
+      - id: source-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.ATLAS_APP_ID }}
+          private-key: ${{ secrets.ATLAS_APP_PRIVATE_KEY }}
+          repositories: ${{ inputs.service }}
+          permission-contents: read
+          permission-checks: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ steps.repo-token.outputs.token }}
+
+      - uses: actions/checkout@v7
+        with:
+          repository: tloi-dalat/${{ inputs.service }}
+          ref: ${{ inputs.sha }}
+          path: source
+          sparse-checkout: schema
+          token: ${{ steps.source-token.outputs.token }}
+
+      - uses: ./.github/actions/setup
+        with:
+          service: ${{ inputs.service }}
+
+      - id: diff
+        name: Diff the live database against schema/
+        env:
+          GH_TOKEN: ${{ steps.repo-token.outputs.token }}
+          SLUG: ${{ steps.repo-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          dir="${ENVIRONMENT}/${SERVICE}"
+          [[ -d source/schema ]] || { echo "::error::${SOURCE_REPO}@${SHA} has no schema/"; exit 1; }
+          compgen -G "${dir}/000001_*.up.sql" > /dev/null || { echo "::error::${dir} has no baseline, run the baseline workflow first"; exit 1; }
+
+          if [[ -n "${PR}" ]]; then
+            branch="${SERVICE}-pr${PR}"
+            title="chore(${ENVIRONMENT}): migrate ${SERVICE} #${PR}"
+            source_url="https://github.com/${SOURCE_REPO}/pull/${PR}"
+          else
+            branch="${SERVICE}-${NAME}"
+            title="chore(${ENVIRONMENT}): migrate ${SERVICE} ${NAME}"
+            source_url="https://github.com/${SOURCE_REPO}/releases/tag/${NAME}"
+          fi
+
+          bot_id=$(gh api "users/${SLUG}[bot]" --jq .id)
+          git config user.name "${SLUG}[bot]"
+          git config user.email "${bot_id}+${SLUG}[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin "${branch}" > /dev/null; then
+            git switch -c "${branch}" "origin/${branch}"
+            git merge --no-edit origin/main
+          else
+            git switch -c "${branch}" origin/main
+          fi
+
+          git rm -q --ignore-unmatch "${dir}/*_${NAME}.up.sql"
+          last=$(find "${dir}" -name '*.up.sql' -printf '%f\n' | sort | tail -1)
+          file="${dir}/$(printf '%06d' $((10#${last:0:6} + 1)))_${NAME}.up.sql"
+
+          atlas schema diff --from "${LIVE_URL}" --to file://source/schema --dev-url "${SCRATCH_URL}" > "${RUNNER_TEMP}/diff.sql"
+          if [[ ! -s "${RUNNER_TEMP}/diff.sql" ]] || grep -q '^Schemas are synced' "${RUNNER_TEMP}/diff.sql"; then
+            changed=false
+          else
+            changed=true
+            mv "${RUNNER_TEMP}/diff.sql" "${file}"
+            git add "${file}"
+          fi
+
+          {
+            echo "changed=${changed}"
+            echo "branch=${branch}"
+            echo "title=${title}"
+            echo "file=${file}"
+            echo "source-url=${source_url}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - id: publish
+        name: Open or update the migration PR
+        env:
+          GH_TOKEN: ${{ steps.repo-token.outputs.token }}
+          CHANGED: ${{ steps.diff.outputs.changed }}
+          BRANCH: ${{ steps.diff.outputs.branch }}
+          TITLE: ${{ steps.diff.outputs.title }}
+          FILE: ${{ steps.diff.outputs.file }}
+          SOURCE_URL: ${{ steps.diff.outputs.source-url }}
+        run: |
+          set -euo pipefail
+          pr_url=$(gh pr list --head "${BRANCH}" --state open --json url --jq '.[0].url // empty')
+
+          if [[ "${CHANGED}" != true ]]; then
+            if [[ -n "${pr_url}" ]]; then
+              gh pr close "${pr_url}" --delete-branch --comment "The live ${ENVIRONMENT} database already matches ${SOURCE_URL}."
+            fi
+            echo "url=" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if ! git diff --cached --quiet; then
+            git commit -q -m "${TITLE}"
+            git push -q -u origin "${BRANCH}"
+          fi
+
+          body=$(printf '%s\n\nGenerated from %s by [this run](%s).\n\n<!-- atlas repository=%s pr=%s check=%s sha=%s -->\n' \
+            "${TITLE}" "${SOURCE_URL}" "${RUN_URL}" "${SOURCE_REPO}" "${PR}" "${CHECK_ID}" "${SHA}")
+          if [[ -n "${pr_url}" ]]; then
+            gh pr edit "${pr_url}" --body "${body}"
+          else
+            pr_url=$(gh pr create --base main --head "${BRANCH}" --title "${TITLE}" --body "${body}")
+          fi
+          echo "url=${pr_url}" >> "${GITHUB_OUTPUT}"
+          cp "${FILE}" "${RUNNER_TEMP}/migration.sql"
+
+      - name: Report to the service
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          CHANGED: ${{ steps.diff.outputs.changed }}
+          PR_URL: ${{ steps.publish.outputs.url }}
+          FILE: ${{ steps.diff.outputs.file }}
+        run: |
+          set -euo pipefail
+          if [[ "${CHANGED}" != true ]]; then
+            gh api -X PATCH "repos/${SOURCE_REPO}/check-runs/${CHECK_ID}" \
+              -f status=completed -f conclusion=success \
+              -f "output[title]=No migration needed" \
+              -f "output[summary]=schema/ matches the live ${ENVIRONMENT} database."
+            body="<!-- atlas-migration -->"$'\n'"No migration needed: schema/ matches the live ${ENVIRONMENT} database."
+          else
+            gh api -X PATCH "repos/${SOURCE_REPO}/check-runs/${CHECK_ID}" \
+              -f status=in_progress \
+              -f "output[title]=Waiting for the migration" \
+              -f "output[summary]=Merge ${PR_URL} to apply it to ${ENVIRONMENT}."
+            sql=$(head -c 60000 "${RUNNER_TEMP}/migration.sql")
+            body=$(printf '<!-- atlas-migration -->\nMigration for %s: %s (`%s`)\n\n```sql\n%s\n```\n' "${ENVIRONMENT}" "${PR_URL}" "${FILE}" "${sql}")
+          fi
+
+          [[ -n "${PR}" ]] || exit 0
+          comment=$(gh api "repos/${SOURCE_REPO}/issues/${PR}/comments" --paginate \
+            --jq '.[] | select(.body | startswith("<!-- atlas-migration -->")) | .id' | tail -1)
+          if [[ -n "${comment}" ]]; then
+            gh api -X PATCH "repos/${SOURCE_REPO}/issues/comments/${comment}" -f body="${body}" > /dev/null
+          else
+            gh api "repos/${SOURCE_REPO}/issues/${PR}/comments" -f body="${body}" > /dev/null
+          fi
+
+      - name: Report the failure
+        if: failure() && steps.source-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+        run: |
+          gh api -X PATCH "repos/${SOURCE_REPO}/check-runs/${CHECK_ID}" \
+            -f status=completed -f conclusion=failure \
+            -f "output[title]=Generating the migration failed" \
+            -f "output[summary]=See ${RUN_URL}"

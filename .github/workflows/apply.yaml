@@ -1,0 +1,138 @@
+name: apply
+on:
+  push:
+    branches: [main]
+    paths: ['development/**', 'production/**']
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [development, production]
+      service:
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - id: targets
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT}" == workflow_dispatch ]]; then
+            pairs="${ENVIRONMENT} ${SERVICE}"
+          else
+            pairs=$(git diff --name-only "${BEFORE}" "${GITHUB_SHA}" -- development production \
+              | awk -F/ 'NF >= 3 { print $1 " " $2 }' | sort -u)
+          fi
+          targets=$(printf '%s\n' "${pairs}" | jq -Rnc '[inputs | select(length > 0) | split(" ") | {environment: .[0], service: .[1]}]')
+          echo "targets=${targets}" >> "${GITHUB_OUTPUT}"
+          echo "${targets}"
+
+  apply:
+    needs: plan
+    if: needs.plan.outputs.targets != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.targets) }}
+    runs-on: atlas-${{ matrix.environment }}
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      ENVIRONMENT: ${{ matrix.environment }}
+      SERVICE: ${{ matrix.service }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          service: ${{ matrix.service }}
+
+      - id: migrate
+        name: Apply
+        run: |
+          set -euo pipefail
+          dir="${ENVIRONMENT}/${SERVICE}"
+          set +e
+          migrate -path "${dir}" -database "${MIGRATE_URL}" up 2>&1 | tee "${RUNNER_TEMP}/migrate.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          version=$(migrate -path "${dir}" -database "${MIGRATE_URL}" version 2>&1 || true)
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "${SERVICE} on ${ENVIRONMENT}: version ${version}" >> "${GITHUB_STEP_SUMMARY}"
+          exit "${status}"
+
+      - id: source
+        name: Find the source of this migration
+        if: always() && github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          marker=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" --jq '.[0].body // ""' \
+            | grep -o '<!-- atlas [^>]*-->' | head -1 || true)
+          field() { sed -nE "s/.* $1=([^ ]*) .*/\1/p" <<< "${marker}"; }
+          repository=$(field repository)
+          if [[ "${repository}" != "tloi-dalat/${SERVICE}" ]]; then
+            echo "check=" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          {
+            echo "pr=$(field pr)"
+            echo "check=$(field check)"
+          } >> "${GITHUB_OUTPUT}"
+
+      - id: source-token
+        if: always() && steps.source.outputs.check != ''
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.ATLAS_APP_ID }}
+          private-key: ${{ secrets.ATLAS_APP_PRIVATE_KEY }}
+          repositories: ${{ matrix.service }}
+          permission-checks: write
+          permission-pull-requests: write
+
+      - name: Report to the service
+        if: always() && steps.source-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          OUTCOME: ${{ steps.migrate.outcome }}
+          VERSION: ${{ steps.migrate.outputs.version }}
+          PR: ${{ steps.source.outputs.pr }}
+          CHECK_ID: ${{ steps.source.outputs.check }}
+        run: |
+          set -euo pipefail
+          repo="tloi-dalat/${SERVICE}"
+          if [[ "${OUTCOME}" == success ]]; then
+            conclusion=success
+            title="Applied to ${ENVIRONMENT}"
+            text="Applied to ${ENVIRONMENT}, now at version ${VERSION}."
+          else
+            conclusion=failure
+            title="Applying to ${ENVIRONMENT} failed"
+            text="Applying to ${ENVIRONMENT} failed, see ${RUN_URL}. Fix the database, then run the force workflow."
+          fi
+          gh api -X PATCH "repos/${repo}/check-runs/${CHECK_ID}" \
+            -f status=completed -f "conclusion=${conclusion}" \
+            -f "output[title]=${title}" -f "output[summary]=${text}" > /dev/null
+          if [[ "${PR}" =~ ^[0-9]+$ ]]; then
+            gh api "repos/${repo}/issues/${PR}/comments" -f body="${text}" > /dev/null
+          fi
