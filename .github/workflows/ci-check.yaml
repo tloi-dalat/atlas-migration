@@ -1,0 +1,22 @@
+name: 'check'
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-check-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  numbering:
+    name: check-numbering
+    permissions:
+      contents: read
+    uses: tloi-dalat/reusable-workflow/.github/workflows/migration-numbering-check.yaml@main
+
+  replay:
+    name: check-replay
+    permissions:
+      contents: read
+    uses: tloi-dalat/reusable-workflow/.github/workflows/migration-replay-check.yaml@main
