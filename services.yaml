@@ -1,0 +1,3 @@
+online-judge:
+  engine: mariadb
+  database: online_judge

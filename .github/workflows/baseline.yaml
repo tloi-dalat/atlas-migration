@@ -1,0 +1,69 @@
+name: baseline
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [development, production]
+      service:
+        type: string
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: atlas-${{ inputs.environment }}
+
+jobs:
+  baseline:
+    runs-on: atlas-${{ inputs.environment }}
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      SERVICE: ${{ inputs.service }}
+    steps:
+      - id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.ATLAS_APP_ID }}
+          private-key: ${{ secrets.ATLAS_APP_PRIVATE_KEY }}
+          repositories: atlas-migration
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@v7
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: ./.github/actions/setup
+        with:
+          service: ${{ inputs.service }}
+
+      - name: Write the baseline
+        run: |
+          set -euo pipefail
+          dir="${ENVIRONMENT}/${SERVICE}"
+          if compgen -G "${dir}/*.sql" > /dev/null; then
+            echo "::error::${dir} already has migrations"
+            exit 1
+          fi
+          mkdir -p "${dir}"
+          atlas schema diff --from "${SCRATCH_URL}" --to "${LIVE_URL}" > "${dir}/000001_baseline.up.sql"
+          grep -c '^CREATE TABLE' "${dir}/000001_baseline.up.sql"
+
+      - name: Open the PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          branch="baseline-${ENVIRONMENT}-${SERVICE}"
+          bot_id=$(gh api "users/${SLUG}[bot]" --jq .id)
+          git config user.name "${SLUG}[bot]"
+          git config user.email "${bot_id}+${SLUG}[bot]@users.noreply.github.com"
+          git switch -c "${branch}"
+          git add "${ENVIRONMENT}/${SERVICE}"
+          git commit -m "chore(${ENVIRONMENT}): add ${SERVICE} baseline"
+          git push -u origin "${branch}"
+          gh pr create --base main --head "${branch}" \
+            --title "chore(${ENVIRONMENT}): add ${SERVICE} baseline" \
+            --body "Baseline of the live ${SERVICE} database in ${ENVIRONMENT}. It is not executed: after merging, run \`force\` with version 1."
