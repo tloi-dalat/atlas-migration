@@ -80,6 +80,30 @@ jobs:
           echo "${SERVICE} on ${ENVIRONMENT}: version ${version}" >> "${GITHUB_STEP_SUMMARY}"
           exit "${status}"
 
+      - name: Sync the schema in SQL Lab
+        if: steps.migrate.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if [[ -z "${SQLLAB_URL:-}" ]]; then
+            echo "No SQL Lab on ${ENVIRONMENT}."
+            exit 0
+          fi
+          instances=$(yq ".\"${SERVICE}\".sqllab // [] | .[]" services.yaml)
+          if [[ -z "${instances}" ]]; then
+            echo "::notice::${SERVICE} has no sqllab instances in services.yaml"
+            exit 0
+          fi
+          echo "::add-mask::${SQLLAB_SERVICE_KEY}"
+          token=$(jq -n --arg email "${SQLLAB_SERVICE_ACCOUNT}" --arg password "${SQLLAB_SERVICE_KEY}" '{email: $email, password: $password}' \
+            | curl -sSf -X POST "${SQLLAB_URL}/v1/auth/login" -H 'Content-Type: application/json' -d @- | jq -r .token)
+          echo "::add-mask::${token}"
+          for instance in ${instances}; do
+            curl -sSf -o /dev/null -X POST "${SQLLAB_URL}/v1/instances/${instance}/databases/${DATABASE}:sync" \
+              -H "Authorization: Bearer ${token}" -H 'Content-Type: application/json' -d '{}'
+            echo "Synced ${instance}/${DATABASE} in SQL Lab." >> "${GITHUB_STEP_SUMMARY}"
+          done
+
       - id: source
         name: Find the source of this migration
         if: always() && github.event_name == 'push'
