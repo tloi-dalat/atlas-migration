@@ -21,7 +21,7 @@ jobs:
           chmod +x "${RUNNER_TEMP}/atlas"
           "${RUNNER_TEMP}/atlas" version
 
-      - name: Inspect online_judge
+      - name: Inspect online_judge database
         run: |
           "${RUNNER_TEMP}/atlas" schema inspect \
             -u "mysql://atlas:${MARIADB_PASSWORD}@${MARIADB_HOST}:${MARIADB_PORT}/online_judge" \
