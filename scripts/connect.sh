@@ -20,7 +20,8 @@ case "${engine}" in
     host="${POSTGRES_HOST}:${POSTGRES_PORT}"
     live="postgres://${auth}@${host}/${database}?search_path=public&sslmode=require"
     scratch="postgres://${auth}@${host}/atlas?search_path=public&sslmode=require"
-    migrate="postgres://${auth}@${host}/${database}?sslmode=require"
+    owner="$(yq ".\"${SERVICE}\".owner // \"${database}\"" services.yaml)"
+    migrate="postgres://${auth}@${host}/${database}?sslmode=require&options=-c%20role%3D${owner}"
     ;;
   *)
     echo "::error::unknown engine '${engine}' for ${SERVICE}"

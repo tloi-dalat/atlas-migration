@@ -2,3 +2,7 @@ online-judge:
   engine: mariadb
   database: online_judge
   sqllab: [mariadb-primary, mariadb-secondary]
+online-quiz:
+  engine: postgres
+  database: online_quiz
+  sqllab: [postgres-primary, postgres-secondary]
