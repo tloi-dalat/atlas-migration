@@ -216,7 +216,7 @@ jobs:
           if [[ -n "${pr_url}" ]]; then
             gh pr edit "${pr_url}" --body "${body}"
           else
-            pr_url=$(gh pr create --base main --head "${BRANCH}" --title "${TITLE}" --body "${body}")
+            pr_url=$(gh pr create --draft --base main --head "${BRANCH}" --title "${TITLE}" --body "${body}")
           fi
           echo "url=${pr_url}" >> "${GITHUB_OUTPUT}"
           cp "${FILE}" "${RUNNER_TEMP}/migration.sql"
