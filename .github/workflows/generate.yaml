@@ -32,6 +32,9 @@ permissions: {}
 jobs:
   generate:
     runs-on: atlas-${{ inputs.environment }}
+    concurrency:
+      group: generate-${{ inputs.service }}-${{ inputs.name }}
+      cancel-in-progress: false
     env:
       ENVIRONMENT: ${{ inputs.environment }}
       SERVICE: ${{ inputs.service }}
@@ -70,12 +73,30 @@ jobs:
           permission-checks: write
           permission-pull-requests: write
 
+      - id: current
+        name: Skip if the PR has moved on
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          [[ -n "${PR}" ]] || exit 0
+          check_sha=$(gh api "repos/${SOURCE_REPO}/check-runs/${CHECK_ID}" --jq .head_sha)
+          head_sha=$(gh api "repos/${SOURCE_REPO}/pulls/${PR}" --jq .head.sha)
+          if [[ "${check_sha}" != "${head_sha}" ]]; then
+            gh api -X PATCH "repos/${SOURCE_REPO}/check-runs/${CHECK_ID}" \
+              -f status=completed -f conclusion=neutral \
+              -f "output[title]=Superseded" -f "output[summary]=A newer commit of #${PR} has its own check." > /dev/null
+            echo "superseded=true" >> "${GITHUB_OUTPUT}"
+          fi
+
       - uses: actions/checkout@v7
+        if: steps.current.outputs.superseded != 'true'
         with:
           fetch-depth: 0
           token: ${{ steps.repo-token.outputs.token }}
 
       - uses: actions/checkout@v7
+        if: steps.current.outputs.superseded != 'true'
         with:
           repository: tloi-dalat/${{ inputs.service }}
           ref: ${{ inputs.sha }}
@@ -84,19 +105,41 @@ jobs:
           token: ${{ steps.source-token.outputs.token }}
 
       - uses: ./.github/actions/setup
+        if: steps.current.outputs.superseded != 'true'
         with:
           service: ${{ inputs.service }}
 
       - id: diff
         name: Diff the live database against schema/
+        if: steps.current.outputs.superseded != 'true'
         env:
           GH_TOKEN: ${{ steps.repo-token.outputs.token }}
+          SOURCE_TOKEN: ${{ steps.source-token.outputs.token }}
           SLUG: ${{ steps.repo-token.outputs.app-slug }}
         run: |
           set -euo pipefail
           dir="${ENVIRONMENT}/${SERVICE}"
           [[ -d source/schema ]] || { echo "::error::${SOURCE_REPO}@${SHA} has no schema/"; exit 1; }
           compgen -G "${dir}/000001_*.up.sql" > /dev/null || { echo "::error::${dir} has no baseline, run the baseline workflow first"; exit 1; }
+
+          if [[ -n "${PR}" ]]; then
+            blocking=()
+            for other in $(find "${dir}" -name '*_pr*.up.sql' -printf '%f\n' | sort \
+              | sed -nE 's/^[0-9]{6}_pr([0-9]+)\.up\.sql$/\1/p' | tail -20 | sort -un); do
+              if [[ "${other}" == "${PR}" ]]; then
+                continue
+              fi
+              state=$(GH_TOKEN="${SOURCE_TOKEN}" gh api "repos/${SOURCE_REPO}/pulls/${other}" --jq 'if .merged_at then "merged" else .state end')
+              if [[ "${state}" == open ]]; then
+                blocking+=("#${other}")
+              fi
+            done
+            if (( ${#blocking[@]} > 0 )); then
+              printf 'The migrations of %s are applied to %s but those PRs are not merged, so this diff would revert them. Merge them first, then re-run this check.\n' \
+                "${blocking[*]}" "${ENVIRONMENT}" | tee "${RUNNER_TEMP}/failure.txt"
+              exit 1
+            fi
+          fi
 
           if [[ -n "${PR}" ]]; then
             branch="${SERVICE}-pr${PR}"
@@ -118,7 +161,9 @@ jobs:
             git switch -c "${branch}" origin/main
           fi
 
-          git rm -q --ignore-unmatch "${dir}/*_${NAME}.up.sql"
+          git diff --name-only --diff-filter=A origin/main -- "${dir}" \
+            | { grep -E "/[0-9]{6}_${NAME//./\\.}\.up\.sql$" || true; } \
+            | xargs -r git rm -q
           last=$(find "${dir}" -name '*.up.sql' -printf '%f\n' | sort | tail -1)
           file="${dir}/$(printf '%06d' $((10#${last:0:6} + 1)))_${NAME}.up.sql"
 
@@ -141,6 +186,7 @@ jobs:
 
       - id: publish
         name: Open or update the migration PR
+        if: steps.current.outputs.superseded != 'true'
         env:
           GH_TOKEN: ${{ steps.repo-token.outputs.token }}
           CHANGED: ${{ steps.diff.outputs.changed }}
@@ -176,6 +222,7 @@ jobs:
           cp "${FILE}" "${RUNNER_TEMP}/migration.sql"
 
       - name: Report to the service
+        if: steps.current.outputs.superseded != 'true'
         env:
           GH_TOKEN: ${{ steps.source-token.outputs.token }}
           CHANGED: ${{ steps.diff.outputs.changed }}
@@ -212,7 +259,18 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.source-token.outputs.token }}
         run: |
+          set -euo pipefail
+          summary=$(cat "${RUNNER_TEMP}/failure.txt" 2> /dev/null || echo "See ${RUN_URL}")
           gh api -X PATCH "repos/${SOURCE_REPO}/check-runs/${CHECK_ID}" \
             -f status=completed -f conclusion=failure \
             -f "output[title]=Generating the migration failed" \
-            -f "output[summary]=See ${RUN_URL}"
+            -f "output[summary]=${summary}" > /dev/null
+          [[ -n "${PR}" ]] || exit 0
+          body="<!-- atlas-migration -->"$'\n'"Generating the ${ENVIRONMENT} migration failed: ${summary}"
+          comment=$(gh api "repos/${SOURCE_REPO}/issues/${PR}/comments" --paginate \
+            --jq '.[] | select(.body | startswith("<!-- atlas-migration -->")) | .id' | tail -1)
+          if [[ -n "${comment}" ]]; then
+            gh api -X PATCH "repos/${SOURCE_REPO}/issues/comments/${comment}" -f body="${body}" > /dev/null
+          else
+            gh api "repos/${SOURCE_REPO}/issues/${PR}/comments" -f body="${body}" > /dev/null
+          fi
