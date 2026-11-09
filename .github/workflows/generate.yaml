@@ -73,6 +73,15 @@ jobs:
           permission-checks: write
           permission-pull-requests: write
 
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ steps.repo-token.outputs.token }}
+
+      - uses: ./.github/actions/setup
+        with:
+          service: ${{ inputs.service }}
+
       - id: current
         name: Skip if the PR has moved on
         env:
@@ -92,22 +101,11 @@ jobs:
       - uses: actions/checkout@v7
         if: steps.current.outputs.superseded != 'true'
         with:
-          fetch-depth: 0
-          token: ${{ steps.repo-token.outputs.token }}
-
-      - uses: actions/checkout@v7
-        if: steps.current.outputs.superseded != 'true'
-        with:
           repository: tloi-dalat/${{ inputs.service }}
           ref: ${{ inputs.sha }}
           path: source
           sparse-checkout: schema
           token: ${{ steps.source-token.outputs.token }}
-
-      - uses: ./.github/actions/setup
-        if: steps.current.outputs.superseded != 'true'
-        with:
-          service: ${{ inputs.service }}
 
       - id: diff
         name: Diff the live database against schema/
